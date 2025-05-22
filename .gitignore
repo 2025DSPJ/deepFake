@@ -1,0 +1,4 @@
+# Python 가상환경 무시
+venv310/
+.venv310/
+model/
