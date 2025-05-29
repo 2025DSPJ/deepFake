@@ -5,3 +5,4 @@ Pillow
 opencv-python
 tqdm
 gdown
+numpy==1.26.4
