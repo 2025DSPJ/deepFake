@@ -88,8 +88,16 @@ def predict_video():
 
     if not predictions:
         return jsonify({'result': 'no face detected'}), 200
-    final_result = 'FAKE' if predictions.count(1) > len(predictions) // 2 else 'REAL'
-    return jsonify({'result': final_result}), 200
+    fake_count = predictions.count(1)
+    total_count = len(predictions)
+
+    fake_confidence = fake_count / total_count 
+    final_result = 'FAKE' if fake_confidence > 0.5 else 'REAL'
+
+    return jsonify({
+        'result': final_result,
+        'confidence': round(fake_confidence, 2)  * 100
+    }), 200
 
 if __name__ == '__main__':
     app.run(host='0.0.0.0', port=5000)
