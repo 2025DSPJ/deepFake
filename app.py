@@ -117,7 +117,6 @@ def predict_video():
     avg_confidence = sum(r['confidence'] for r in results) / len(results)
 
     #테스트
-    print("🔍 예측 완료")
     print(f"결과: {final_label}")
     print(f"평균 fake confidence: {avg_confidence:.4f}")
     print(f"최고 confidence: {max_confidence:.4f}")
