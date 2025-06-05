@@ -16,9 +16,10 @@ import gdown
 from flask_cors import CORS
 
 
-  
-
+# 모델 경로 지정
 model_path = './model/xception.pth'
+
+# 모델이 없을 경우, Google Drive에서 다운로드
 if not os.path.exists(model_path):
     print("모델이 없어서 Google Drive에서 다운로드")
     os.makedirs('./model', exist_ok=True)
@@ -28,6 +29,7 @@ app = Flask(__name__)
 CORS(app, resources={r"/*": {"origins": "*"}})
 face_detector = dlib.get_frontal_face_detector()
 
+# 모델 불러오기
 model = model_selection(modelname='xception', num_out_classes=2)
 model.load_state_dict(torch.load(model_path, map_location='cpu'))
 model.eval()
@@ -47,8 +49,6 @@ def predict(image):
         pred = torch.argmax(probs, dim=1).item()
     return pred, confidence
 
-UPLOAD_FOLDER = "uploads"
-os.makedirs(UPLOAD_FOLDER, exist_ok=True)
 
 @app.route('/predict', methods=['POST'])
 
@@ -68,8 +68,9 @@ def predict_video():
     results = []
     max_confidence = -1
     max_conf_frame = None
-
     frame_num = 0
+
+
     while cap.isOpened():
         ret, frame = cap.read()
         if not ret or frame is None:
@@ -115,6 +116,7 @@ def predict_video():
 
     avg_confidence = sum(r['confidence'] for r in results) / len(results)
 
+    #테스트
     print("🔍 예측 완료")
     print(f"결과: {final_label}")
     print(f"평균 fake confidence: {avg_confidence:.4f}")
@@ -123,8 +125,8 @@ def predict_video():
 
     return jsonify({
         'result': final_label,
-        'average_fake_confidence': round(avg_confidence, 4),
-        'max_confidence': round(max_confidence, 4),
+        'average_fake_confidence': round(avg_confidence, 2) * 100,
+        'max_confidence': round(max_confidence, 2) *100,
         'most_suspect_image': img_base64  # base64 encoded image
     }), 200
 
