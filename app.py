@@ -14,7 +14,23 @@ from network.models import model_selection  # xception 모델 불러오는 함�
 from dataset.transform import xception_default_data_transforms
 import gdown
 from flask_cors import CORS
+import requests
+import uuid
 
+SPRING_SERVER_URL = 'http://localhost:8080/progress' 
+
+def send_progress_to_spring(task_id, percent):
+    try:
+        payload = {
+            'taskId': task_id,
+            'progress': percent
+        }
+        headers = {
+            'Content-Type': 'application/json'
+        }
+        requests.post(SPRING_SERVER_URL, json=payload, headers=headers, timeout=1)
+    except Exception as e:
+        print(f"[WARN] 진행률 전송 실패: {e}")
 
 # 모델 경로 지정
 model_path = './model/xception.pth'
@@ -51,15 +67,19 @@ def predict(image):
 
 
 @app.route('/predict', methods=['POST'])
-
 def predict_video():
     if 'file' not in request.files:
         return jsonify({'error': 'No file uploaded'}), 400
 
     video_file = request.files['file']
+    task_id = request.form.get('taskId')
+    if not task_id:
+        task_id = str(uuid.uuid4())
+        print(f"[INFO] taskId 없음 → 새로 생성됨: {task_id}")
     with tempfile.NamedTemporaryFile(delete=False, suffix='.mp4') as tmp:
         video_path = tmp.name
         video_file.save(video_path)
+
 
     cap = cv2.VideoCapture(video_path)
     num_frames = int(cap.get(cv2.CAP_PROP_FRAME_COUNT))
@@ -69,6 +89,7 @@ def predict_video():
     max_confidence = -1
     max_conf_frame = None
     frame_num = 0
+    processed_frames = 0
 
 
     while cap.isOpened():
@@ -97,6 +118,12 @@ def predict_video():
                         max_conf_frame = face_img.copy()
             except Exception as e:
                 print(f"Error in face detection or prediction: {e}")
+        
+            # 진행률 계산 및 전송
+            processed_frames += 1
+            progress_percent = int((processed_frames / (num_frames // frame_interval)) * 100)
+            send_progress_to_spring(task_id, progress_percent)
+
         frame_num += 1
 
     cap.release()
@@ -130,4 +157,4 @@ def predict_video():
     }), 200
 
 if __name__ == '__main__':
-    app.run(host='0.0.0.0', port=5000)
+    app.run(host='0.0.0.0', port=5001)
