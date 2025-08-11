@@ -18,6 +18,7 @@ import requests
 import uuid
 
 SPRING_SERVER_URL = 'http://localhost:8080/progress' 
+model_path = './model/xception.pth'
 
 def send_progress_to_spring(task_id, percent):
     try:
@@ -32,15 +33,14 @@ def send_progress_to_spring(task_id, percent):
     except Exception as e:
         print(f"[WARN] 진행률 전송 실패: {e}")
 
-# 모델 경로 지정
-model_path = './model/xception.pth'
+def ensure_model():
+    # 모델이 없을 경우, Google Drive에서 다운로드
+    if not os.path.exists(model_path):
+        print("모델이 없어서 Google Drive에서 다운로드")
+        os.makedirs('./model', exist_ok=True)
+        gdown.download(id='1j8AesqDjbSG0RfqaYaHdfGcVVkpdIPKJ', output=model_path, quiet=False)
 
-# 모델이 없을 경우, Google Drive에서 다운로드
-if not os.path.exists(model_path):
-    print("모델이 없어서 Google Drive에서 다운로드")
-    os.makedirs('./model', exist_ok=True)
-    gdown.download(id='1j8AesqDjbSG0RfqaYaHdfGcVVkpdIPKJ', output=model_path, quiet=False)
-
+ensure_model()
 app = Flask(__name__)
 CORS(app, resources={r"/*": {"origins": "*"}})
 face_detector = dlib.get_frontal_face_detector()
