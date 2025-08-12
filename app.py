@@ -344,8 +344,8 @@ def predict_video():
 
     return jsonify({
         'result': final_label,
-        'average_fake_confidence': round(avg_confidence, 2) * 100,
-        'max_confidence': round(max_confidence, 2) *100,
+        'average_fake_confidence': round(avg_confidence, 4),
+        'max_confidence': round(max_confidence, 4) if max_confidence >= 0 else None,
         'most_suspect_image': img_base64,  # base64 encoded image
         'options_used': {
             'mode': mode, 'use_tta': use_tta, 'use_illum': use_illum,
