@@ -317,11 +317,13 @@ def predict_video():
     if not results:
         return jsonify({
             'result': 'no face detected',
-            'options_used': {
-                'mode': mode, 'use_tta': use_tta, 'use_illum': use_illum,
-                'detector': detector, 'smooth_window': smooth_window,
-                'min_face': min_face, 'sample_count': sample_count
-            },
+            'mode': mode, 
+            'use_tta': use_tta, 
+            'use_illum': use_illum,
+            'detector': detector, 
+            'smooth_window': smooth_window,
+            'min_face': min_face, 
+            'sample_count': sample_count,    
             'taskId': task_id
         }), 200
 
@@ -346,13 +348,15 @@ def predict_video():
         'result': final_label,
         'average_fake_confidence': round(avg_confidence, 4),
         'max_confidence': round(max_confidence, 4) if max_confidence >= 0 else None,
+        'mode': mode, 
+        'use_tta': use_tta, 
+        'use_illum': use_illum,
+        'detector': detector,
+        'smooth_window': smooth_window,
+        'min_face': min_face,
+        'sample_count': sample_count,
+        'taskId': task_id,
         'most_suspect_image': img_base64,  # base64 encoded image
-        'options_used': {
-            'mode': mode, 'use_tta': use_tta, 'use_illum': use_illum,
-            'detector': detector, 'smooth_window': smooth_window,
-            'min_face': min_face, 'sample_count': sample_count
-        },
-        'taskId': task_id
     }), 200
 
 if __name__ == '__main__':
