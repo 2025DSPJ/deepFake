@@ -1,56 +1,83 @@
-from flask import Flask, request, jsonify, send_file
+from flask import Flask, request, jsonify
 import torch
 import torch.nn as nn
-import torchvision.transforms as transforms
 from PIL import Image as pil_image
 import cv2
 import dlib
 import tempfile
 import os
-import io
 import base64
 import numpy as np
-from tqdm import tqdm
 from network.models import model_selection  # xception 모델 불러오는 함수
 from dataset.transform import xception_default_data_transforms
 import gdown
 from flask_cors import CORS
 import requests
 import uuid
-from collections import deque
+import time
+import matplotlib
+matplotlib.use("Agg")  # 서버(무헤드) 환경에서 플롯 저장
+import matplotlib.pyplot as plt
 
-SPRING_SERVER_URL = 'http://localhost:8080/progress' 
-model_path = './model/xception.pth'
+# ===== 설정 =====
+SPRING_SERVER_URL = 'http://localhost:8080/progress'
+MODEL_PATH = './model/xception.pth'
+OUTPUT_ROOT = os.environ.get("OUTPUT_ROOT", "./outputs")  # 그래프 저장 루트
+os.makedirs(OUTPUT_ROOT, exist_ok=True)
 
+# 속도 목표 기본값(환경변수로 조정 가능)
+TARGET_FPS_DEFAULT = float(os.environ.get("TARGET_FPS", "1.0"))         # 목표 처리량 (fps)
+MAX_LAT_MS_DEFAULT = float(os.environ.get("MAX_LATENCY_MS", "2000"))    # 프레임당 최대 지연(ms)
+
+# ===== 유틸: 진행률 보고 =====
 def send_progress_to_spring(task_id, percent):
     try:
-        payload = {
-            'taskId': task_id,
-            'progress': percent
-        }
-        headers = {
-            'Content-Type': 'application/json'
-        }
+        payload = {'taskId': task_id, 'progress': percent}
+        headers = {'Content-Type': 'application/json'}
         requests.post(SPRING_SERVER_URL, json=payload, headers=headers, timeout=1)
     except Exception as e:
         print(f"[WARN] 진행률 전송 실패: {e}")
 
+# ===== 유틸: 모델 파일 확보 =====
 def ensure_model():
-    # 모델이 없을 경우, Google Drive에서 다운로드
-    if not os.path.exists(model_path):
+    if not os.path.exists(MODEL_PATH):
         print("모델이 없어서 Google Drive에서 다운로드")
         os.makedirs('./model', exist_ok=True)
-        gdown.download(id='1j8AesqDjbSG0RfqaYaHdfGcVVkpdIPKJ', output=model_path, quiet=False)
+        gdown.download(id='1j8AesqDjbSG0RfqaYaHdfGcVVkpdIPKJ', output=MODEL_PATH, quiet=False)
 
+# ===== 유틸: 그림 저장 =====
+def _save_fig(fig, path):
+    os.makedirs(os.path.dirname(path), exist_ok=True)
+    fig.savefig(path, format="png", dpi=200, bbox_inches="tight")
+    plt.close(fig)
+
+def save_heatmap(per_frame_conf, out_path):
+    if not per_frame_conf:
+        return None
+    arr = np.array(per_frame_conf, dtype=np.float32)[None, :]
+    fig = plt.figure(figsize=(10, 2.0))
+    ax = plt.subplot(111)
+    im = ax.imshow(arr, aspect='auto', vmin=0.0, vmax=1.0)
+    cbar = fig.colorbar(im, ax=ax)
+    cbar.set_label("Fake confidence (0–1)")
+    ax.set_yticks([])
+    ax.set_xlabel("Frame index")
+    ax.set_title("Per-frame Fake Confidence Heatmap")
+    fig.tight_layout()
+    _save_fig(fig, out_path)
+    return out_path
+
+# ===== Flask 앱/모델 초기화 =====
 ensure_model()
 app = Flask(__name__)
 CORS(app, resources={r"/*": {"origins": "*"}})
+
 face_detector = dlib.get_frontal_face_detector()
 
-# OpenCV DNN face detector (백업용)
+# OpenCV DNN face detector (백업/정밀 기본)
 try:
     DNN_PROTO = "deploy.prototxt"
-    DNN_MODEL = "res10_300x300_ssd_iter_140000.caffemodel"
+    DNN_MODEL = "res10_300x300_ssd_iter_140000_fp16.caffemodel"
     face_net = cv2.dnn.readNetFromCaffe(DNN_PROTO, DNN_MODEL) if os.path.exists(DNN_PROTO) and os.path.exists(DNN_MODEL) else None
 except Exception as e:
     print(f"[WARN] DNN detector 초기화 실패: {e}")
@@ -58,117 +85,143 @@ except Exception as e:
 
 # 모델 불러오기
 model = model_selection(modelname='xception', num_out_classes=2)
-model.load_state_dict(torch.load(model_path, map_location='cpu'))
+model.load_state_dict(torch.load(MODEL_PATH, map_location='cpu'))
 model.eval()
 softmax = nn.Softmax(dim=1)
 
-
-# ---------------------------
-# 기본 모드용 유틸
-# ---------------------------
-
-def preprocess_image(image):
-    image = cv2.cvtColor(image, cv2.COLOR_BGR2RGB)
-    transform = xception_default_data_transforms['test']
-    img_tensor = transform(pil_image.fromarray(image)).unsqueeze(0)
-    return img_tensor
-
-def predict(image):
-    with torch.no_grad():
-        input_tensor = preprocess_image(image)
-        output = model(input_tensor)
-        probs = nn.Softmax(dim=1)(output)
-        confidence = probs[0][1].item()  # FAKE 확률
-        pred = torch.argmax(probs, dim=1).item()
-    return pred, confidence
-
-# ---------------------------
-# 정밀 모드용 유틸 
-# ---------------------------
-def _apply_photometric_norm(face_bgr):
-    # 1) CLAHE in LAB
-    lab = cv2.cvtColor(face_bgr, cv2.COLOR_BGR2LAB)
-    L, A, B = cv2.split(lab)
-    clahe = cv2.createCLAHE(clipLimit=2.0, tileGridSize=(8,8))
-    L = clahe.apply(L)
-    lab = cv2.merge([L, A, B])
-    face_bgr = cv2.cvtColor(lab, cv2.COLOR_LAB2BGR)
-
-    # 2) Gray-world white balance
-    eps = 1e-6
-    avg_b, avg_g, avg_r = face_bgr[:,:,0].mean()+eps, face_bgr[:,:,1].mean()+eps, face_bgr[:,:,2].mean()+eps
-    gray_mean = (avg_b + avg_g + avg_r) / 3.0
-    scale_b, scale_g, scale_r = gray_mean/avg_b, gray_mean/avg_g, gray_mean/avg_r
-    face_bgr = face_bgr.astype(np.float32)
-    face_bgr[:,:,0] *= scale_b
-    face_bgr[:,:,1] *= scale_g
-    face_bgr[:,:,2] *= scale_r
-    face_bgr = np.clip(face_bgr, 0, 255).astype(np.uint8)
-
-    # 3) Mild gamma correction
-    gray = cv2.cvtColor(face_bgr, cv2.COLOR_BGR2GRAY)
-    mid = max(np.median(gray)/255.0, 1e-3)
-    gamma = float(np.clip(np.log(0.5)/np.log(mid), 0.67, 1.5))
-    inv = 1.0/gamma
-    table = (np.linspace(0,1,256) ** inv * 255).astype(np.uint8)
-    face_bgr = cv2.LUT(face_bgr, table)
-    return face_bgr
-
-def preprocess_face_tensor(face_bgr, use_illum=False):
-    if use_illum:
-        face_bgr = _apply_photometric_norm(face_bgr)
+# ===== 공통 전처리 =====
+def to_tensor_bgr(face_bgr):
     face_rgb = cv2.cvtColor(face_bgr, cv2.COLOR_BGR2RGB)
     transform = xception_default_data_transforms['test']
     return transform(pil_image.fromarray(face_rgb)).unsqueeze(0)
 
-def predict_base(face_bgr, use_illum=False):
-    with torch.no_grad():
-        input_tensor = preprocess_face_tensor(face_bgr, use_illum=use_illum)
-        output = model(input_tensor)
-        probs = softmax(output)[0]
-        confidence_fake = float(probs[1].item())
-        pred = int(torch.argmax(probs).item())  # 0: REAL, 1: FAKE
-    return pred, confidence_fake
+# --- 조명 조건 판단(밝기+대비) & HSV 기반 보정(저강도) ---
+def need_illum(gray):
+    m, s = float(gray.mean()), float(gray.std())
+    return (m < 70.0) or (s < 25.0)
 
-def predict_tta(face_bgr, use_illum=False):
-    augments = [
-        lambda x: x,
-        lambda x: cv2.flip(x, 1),
-        lambda x: cv2.convertScaleAbs(x, alpha=1.0, beta=10),   # brighter
-        lambda x: cv2.convertScaleAbs(x, alpha=0.9, beta=-10),  # darker
-    ]
-    acc = 0.0
+def illum_hsv(face_bgr):
+    hsv = cv2.cvtColor(face_bgr, cv2.COLOR_BGR2HSV)
+    h, s, v = cv2.split(hsv)
+    clahe = cv2.createCLAHE(clipLimit=1.8, tileGridSize=(8,8))
+    v = clahe.apply(v)
+    mid = max(np.median(v)/255.0, 1e-3)
+    gamma = float(np.clip(np.log(0.5)/np.log(mid), 0.8, 1.4))
+    lut = (np.linspace(0,1,256)**(1.0/gamma) * 255).astype(np.uint8)
+    v = cv2.LUT(v, lut)
+    hsv = cv2.merge([h, s, v])
+    return cv2.cvtColor(hsv, cv2.COLOR_HSV2BGR)
+
+# --- 품질/조명 메트릭 ---
+def var_laplace(gray):
+    return float(cv2.Laplacian(gray, cv2.CV_64F).var())
+
+def luma_mean(gray):
+    return float(gray.mean())
+
+# ===== 기본 모드 유틸 =====
+def predict_single_tensor(img_tensor):
     with torch.no_grad():
-        for aug in augments:
-            img = aug(face_bgr.copy())
-            input_tensor = preprocess_face_tensor(img, use_illum=use_illum)
-            output = model(input_tensor)
-            acc += float(softmax(output)[0][1].item())
-    conf = acc / len(augments)
+        output = model(img_tensor)
+        probs = softmax(output)[0]
+        conf_fake = float(probs[1].item())
+        pred = int(torch.argmax(probs).item())  # 0: REAL, 1: FAKE
+    return pred, conf_fake
+
+def predict(face_bgr):
+    return predict_single_tensor(to_tensor_bgr(face_bgr))
+
+# ===== 정밀 모드: 약한 기하/노출 브라케팅 TTA(가중 평균) =====
+def warp_rotate(img, angle=0):
+    h, w = img.shape[:2]
+    M = cv2.getRotationMatrix2D((w/2, h/2), angle, 1.0)
+    return cv2.warpAffine(img, M, (w, h), flags=cv2.INTER_LINEAR, borderMode=cv2.BORDER_REPLICATE)
+
+def warp_shift(img, dx=0, dy=0):
+    h, w = img.shape[:2]
+    M = np.float32([[1,0,dx],[0,1,dy]])
+    return cv2.warpAffine(img, M, (w, h), flags=cv2.INTER_LINEAR, borderMode=cv2.BORDER_REPLICATE)
+
+def predict_tta_weighted(face_bgr, use_cond_illum=False):
+    proc = face_bgr.copy()
+    gray = cv2.cvtColor(proc, cv2.COLOR_BGR2GRAY)
+    if use_cond_illum and need_illum(gray):
+        proc = illum_hsv(proc)
+    augs = [
+        ("orig", lambda x: x, 0.4),
+        ("flip", lambda x: cv2.flip(x, 1), None),
+        ("rot+", lambda x: warp_rotate(x, +2), None),
+        ("rot-", lambda x: warp_rotate(x, -2), None),
+        ("sh+x", lambda x: warp_shift(x, +2, 0), None),
+        ("sh-x", lambda x: warp_shift(x, -2, 0), None),
+        ("b+10", lambda x: cv2.convertScaleAbs(x, alpha=1.0, beta=10), None),
+        ("b-10", lambda x: cv2.convertScaleAbs(x, alpha=1.0, beta=-10), None),
+        ("ct+5", lambda x: cv2.convertScaleAbs(x, alpha=1.05, beta=0), None),
+        ("ct-5", lambda x: cv2.convertScaleAbs(x, alpha=0.95, beta=0), None),
+    ]
+    remain = 1.0 - 0.4
+    rest = len(augs) - 1
+    for i in range(1, len(augs)):
+        augs[i] = (augs[i][0], augs[i][1], remain / rest)
+    conf_acc, w_acc = 0.0, 0.0
+    with torch.no_grad():
+        for name, aug, w in augs:
+            img = aug(proc.copy())
+            _, conf_i = predict_single_tensor(to_tensor_bgr(img))
+            conf_acc += w * conf_i
+            w_acc += w
+    conf = conf_acc / max(w_acc, 1e-6)
     pred = 1 if conf >= 0.5 else 0
     return pred, conf
 
-def detect_face_bbox(frame_bgr, detector='auto', dnn_conf=0.6):
-    """dlib 우선, 실패 시 DNN(있으면) 백업"""
+def infer_prob(face_bgr, mode, use_tta, use_illum):
+    if (mode == 'precision') and use_tta:
+        _, p = predict_tta_weighted(face_bgr, use_cond_illum=bool(use_illum))
+    else:
+        _, p = predict(face_bgr)
+    return float(p)
+
+# ====== 안정성 지표 계산 ======
+def tta_consistency_std(face_bgr, mode, use_tta, use_illum):
+    augs = [
+        lambda x: x,
+        lambda x: cv2.flip(x, 1),
+        lambda x: warp_rotate(x, +2),
+        lambda x: warp_rotate(x, -2),
+        lambda x: warp_shift(x, +2, 0),
+        lambda x: warp_shift(x, -2, 0),
+        lambda x: cv2.convertScaleAbs(x, alpha=1.05, beta=0),
+        lambda x: cv2.convertScaleAbs(x, alpha=0.95, beta=0),
+    ]
+    ps = [infer_prob(aug(face_bgr), mode, use_tta, use_illum) for aug in augs]
+    ps = np.array(ps, dtype=np.float32)
+    return float(ps.std()), float(ps.mean())
+
+def temporal_delta_stats(per_frame_conf):
+    if len(per_frame_conf) < 2:
+        return None, None
+    arr = np.array(per_frame_conf, dtype=np.float32)
+    diffs = np.abs(np.diff(arr))
+    return float(diffs.mean()), float(diffs.std())
+
+# ===== 얼굴 검출기: 다중 박스 반환 =====
+def detect_face_bboxes(frame_bgr, detector='auto', dnn_conf=0.6, max_boxes=5):
     h, w = frame_bgr.shape[:2]
-    # dlib
+    boxes = []
     if detector in ('auto','dlib'):
         try:
             gray = cv2.cvtColor(frame_bgr, cv2.COLOR_BGR2GRAY)
             faces = face_detector(gray)
-            if faces:
-                f = faces[0]
+            for f in faces:
                 x1,y1,x2,y2 = max(f.left(),0), max(f.top(),0), min(f.right(),w), min(f.bottom(),h)
                 if (x2-x1)>0 and (y2-y1)>0:
-                    return x1,y1,x2,y2
+                    boxes.append((x1,y1,x2,y2, 0.6))  # dummy conf
         except Exception as e:
             print(f"[WARN] dlib detect error: {e}")
-    # DNN
     if detector in ('auto','dnn') and face_net is not None:
         blob = cv2.dnn.blobFromImage(cv2.resize(frame_bgr, (300,300)), 1.0, (300,300), (104,177,123))
         face_net.setInput(blob)
         detections = face_net.forward()
-        best, best_conf = None, 0.0
         for i in range(detections.shape[2]):
             conf = float(detections[0,0,i,2])
             if conf > dnn_conf:
@@ -176,10 +229,12 @@ def detect_face_bbox(frame_bgr, detector='auto', dnn_conf=0.6):
                 x1,y1,x2,y2 = box.astype(int)
                 x1,y1 = max(x1,0), max(y1,0)
                 x2,y2 = min(x2,w), min(y2,h)
-                if conf > best_conf and (x2-x1)>0 and (y2-y1)>0:
-                    best, best_conf = (x1,y1,x2,y2), conf
-        return best
-    return None
+                if (x2-x1)>0 and (y2-y1)>0:
+                    boxes.append((x1,y1,x2,y2, conf))
+    boxes = list({(x1,y1,x2,y2):conf for x1,y1,x2,y2,conf in boxes}.items())
+    boxes = [(b[0][0],b[0][1],b[0][2],b[0][3],b[1]) for b in boxes]
+    boxes.sort(key=lambda b: (b[2]-b[0])*(b[3]-b[1]), reverse=True)
+    return boxes[:max_boxes]
 
 def encode_jpg_base64(image_bgr):
     ok, buf = cv2.imencode('.jpg', image_bgr)
@@ -187,55 +242,70 @@ def encode_jpg_base64(image_bgr):
         return None
     return base64.b64encode(buf).decode('utf-8')
 
-
+# ===== API =====
 @app.route('/predict', methods=['POST'])
 def predict_video():
     if 'file' not in request.files:
         return jsonify({'error': 'No file uploaded'}), 400
 
+    start_ts = time.time()
+    per_frame_conf = []         # (스무딩된) 프레임별 확률 기록 (시각화용)
+    raw_conf_for_vote = []      # 집계용: (p_i, q_i, l_i)
+
     video_file = request.files['file']
-    task_id = request.form.get('taskId')
-    if not task_id:
-        task_id = str(uuid.uuid4())
-        print(f"[INFO] taskId 없음 → 새로 생성됨: {task_id}")
+    task_id = request.form.get('taskId') or str(uuid.uuid4())
+    print(f"[INFO] taskId={task_id}")
 
     mode = request.form.get('mode', 'default')  # "default" | "precision"
     use_tta = request.form.get('use_tta')
     use_illum = request.form.get('use_illum')
-    detector = request.form.get('detector', 'auto')  # auto|dlib|dnn
+    detector = request.form.get('detector') or ('dnn' if mode=='precision' else 'auto')  # 정밀 기본 DNN
     smooth_window = int(request.form.get('smooth_window', 0) or 0)
-    min_face = int(request.form.get('min_face', 64) or 64)
-    sample_count = int(request.form.get('sample_count', 10) or 10)
+    min_face = int(request.form.get('min_face', 96 if mode=='precision' else 64) or (96 if mode=='precision' else 64))
+    sample_count = int(request.form.get('sample_count', 20 if mode=='precision' else 10) or (20 if mode=='precision' else 10))
+
+    # 속도 목표 파라미터(요청이 우선, 없으면 환경변수 기본)
+    target_fps = float(request.form.get('target_fps', TARGET_FPS_DEFAULT))
+    max_latency_ms = float(request.form.get('max_latency_ms', MAX_LAT_MS_DEFAULT))
+    # if mode == 'default':
+    #     if 'target_fps' not in request.form:
+    #         target_fps = 0.35     # 기본모드 목표 처리량
+    #     if 'max_latency_ms' not in request.form:
+    #         max_latency_ms = 3000.0  # 기본모드 지연 목표
+    # elif mode == 'precision':
+    #     if 'target_fps' not in request.form:
+    #         target_fps = 0.20
+    #     if 'max_latency_ms' not in request.form:
+    #         max_latency_ms = 5000.0
+    target_fps = 0.27     # 기본모드 목표 처리량
+    max_latency_ms = 4000.0  # 기본모드 지연 목표
 
     # 프리셋
     if mode == 'precision':
         use_tta = True if use_tta is None else (use_tta.lower() == 'true')
         use_illum = True if use_illum is None else (use_illum.lower() == 'true')
-        smooth_window = smooth_window or 5
-        sample_count = sample_count or 15
+        smooth_window = smooth_window or 0   # EMA로 대체
+        sample_count = sample_count or 20
     else:
         use_tta = False if use_tta is None else (use_tta.lower() == 'true')
         use_illum = False if use_illum is None else (use_illum.lower() == 'true')
         smooth_window = smooth_window or 0
         sample_count = sample_count or 10
 
-
+    # 동영상 임시 저장
     with tempfile.NamedTemporaryFile(delete=False, suffix='.mp4') as tmp:
         video_path = tmp.name
         video_file.save(video_path)
 
-
     cap = cv2.VideoCapture(video_path)
     num_frames = int(cap.get(cv2.CAP_PROP_FRAME_COUNT))
 
-    
     if num_frames == 0:
         cap.release()
         os.remove(video_path)
         return jsonify({'error': 'Invalid video or zero frames'}), 400
 
-
-    # 균등 샘플링 (sample_count개)
+    # 균등 샘플링
     step = max(1, num_frames // max(1, sample_count))
     target_indices = set([min(i*step, num_frames-1) for i in range(max(1, sample_count))])
 
@@ -244,50 +314,70 @@ def predict_video():
     max_conf_frame = None
     processed_frames = 0
     expected = len(target_indices)
-    q = deque(maxlen=smooth_window) if smooth_window > 0 else None
 
+    ema = None  # EMA 스무딩
     frame_idx = 0
+    scene_lumas = []
 
     while cap.isOpened():
         ret, frame = cap.read()
         if not ret or frame is None:
             break
+
         if frame_idx in target_indices:
             try:
                 if frame.dtype != 'uint8':
                     frame = frame.astype('uint8')
-                
+
                 if mode == 'precision':
                     # ---- 정밀 모드 ----
-                    bbox = detect_face_bbox(frame, detector=detector)
-                    if bbox:
-                        x1, y1, x2, y2 = bbox
-                        face_img = frame[y1:y2, x1:x2]
-                        if face_img.size > 0 and min(face_img.shape[:2]) >= min_face:
-                            mean_luma = cv2.cvtColor(face_img, cv2.COLOR_BGR2GRAY).mean()
-                            auto_illum = use_illum or (mean_luma < 25 or mean_luma > 230)
+                    bboxes = detect_face_bboxes(frame, detector=detector, dnn_conf=0.6, max_boxes=5)
+                    if bboxes:
+                        bboxes_sorted_area = sorted(bboxes, key=lambda b:(b[2]-b[0])*(b[3]-b[1]), reverse=True)
+                        primary = bboxes_sorted_area[0]
+                        bboxes_sorted_conf = sorted(bboxes, key=lambda b:b[4], reverse=True)
+                        secondary = bboxes_sorted_conf[0]
+                        chosen = [primary]
+                        if secondary != primary and len(bboxes_sorted_area)>1:
+                            chosen.append(secondary)
 
-                            if use_tta:
-                                pred, confidence = predict_tta(face_img, use_illum=auto_illum)
+                        frame_best_conf = 0.0
+                        for (x1,y1,x2,y2, conf_det) in chosen[:2]:
+                            face_img = frame[y1:y2, x1:x2]
+                            if face_img.size == 0 or min(face_img.shape[:2]) < min_face:
+                                continue
+                            gray_face = cv2.cvtColor(face_img, cv2.COLOR_BGR2GRAY)
+                            q = var_laplace(gray_face)
+                            l = luma_mean(gray_face)
+
+                            pred_i, conf_i = (
+                                predict_tta_weighted(face_img, use_cond_illum=use_illum)
+                                if use_tta else
+                                predict(face_img)
+                            )
+
+                            # EMA 스무딩 (프레임 대표 확률에 적용)
+                            if ema is None:
+                                ema = conf_i
                             else:
-                                pred, confidence = predict_base(face_img, use_illum=auto_illum)
+                                ema = 0.5*conf_i + 0.5*ema
+                            conf_s = float(ema)
 
-                            if q is not None:
-                                q.append(confidence)
-                                conf_s = float(sum(q)/len(q))
-                                pred_s = 1 if conf_s >= 0.5 else 0
-                                results.append({'pred': pred_s, 'confidence': conf_s})
-                            else:
-                                results.append({'pred': pred, 'confidence': confidence})
+                            raw_conf_for_vote.append( (conf_i, q, l) )
+                            per_frame_conf.append(conf_s)
+                            results.append({'pred': 1 if conf_s>=0.5 else 0, 'confidence': conf_s})
 
-                            if confidence > max_confidence:
-                                max_confidence = confidence
-                                max_conf_frame = face_img.copy()
+                            if conf_i > frame_best_conf:
+                                frame_best_conf = conf_i
+                                if conf_i > max_confidence:
+                                    max_confidence = conf_i
+                                    max_conf_frame = face_img.copy()
+
+                            scene_lumas.append(l)
 
                 else:
+                    # ---- 기본 모드 ----
                     gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
-                    if gray.dtype != 'uint8':
-                        gray = gray.astype('uint8')
                     faces = face_detector(gray)
                     if faces:
                         x1 = max(faces[0].left(), 0)
@@ -295,21 +385,36 @@ def predict_video():
                         x2 = min(faces[0].right(), frame.shape[1])
                         y2 = min(faces[0].bottom(), frame.shape[0])
                         face_img = frame[y1:y2, x1:x2]
-                        pred, confidence = predict(face_img)
-                        results.append({'pred': pred, 'confidence': confidence})
+                        if face_img.size > 0 and min(face_img.shape[:2]) >= 64:
+                            gray_face = cv2.cvtColor(face_img, cv2.COLOR_BGR2GRAY)
+                            q = var_laplace(gray_face)
+                            l = luma_mean(gray_face)
+                            pred, conf = predict(face_img)
 
-                        if confidence > max_confidence:
-                            max_confidence = confidence
-                            max_conf_frame = face_img.copy()
+                            if ema is None:
+                                ema = conf
+                            else:
+                                ema = 0.5*conf + 0.5*ema
+                            conf_s = float(ema)
+
+                            raw_conf_for_vote.append( (conf, q, l) )
+                            per_frame_conf.append(conf_s)
+                            results.append({'pred': 1 if conf_s>=0.5 else 0, 'confidence': conf_s})
+
+                            if conf > max_confidence:
+                                max_confidence = conf
+                                max_conf_frame = face_img.copy()
+
+                            scene_lumas.append(l)
+
             except Exception as e:
-                print(f"Error in face detection or prediction: {e}")
-        
-            # 진행률 계산 및 전송
+                print(f"Error in detection/prediction: {e}")
+
             processed_frames += 1
             progress_percent = int(100 * processed_frames / max(1, expected))
             send_progress_to_spring(task_id, progress_percent)
 
-        frame_idx+= 1
+        frame_idx += 1
 
     cap.release()
     os.remove(video_path)
@@ -317,46 +422,124 @@ def predict_video():
     if not results:
         return jsonify({
             'result': 'no face detected',
-            'mode': mode, 
-            'use_tta': use_tta, 
+            'mode': mode,
+            'use_tta': use_tta,
             'use_illum': use_illum,
-            'detector': detector, 
+            'detector': detector,
             'smooth_window': smooth_window,
-            'min_face': min_face, 
-            'sample_count': sample_count,    
+            'min_face': min_face,
+            'sample_count': sample_count,
             'taskId': task_id
         }), 200
 
-    final_label = 'FAKE' if sum(r['pred'] for r in results) > len(results) // 2 else 'REAL'
+    # ===== 집계: 가중 투표 =====
+    weights, scores = [], []
+    for (p, q, l) in raw_conf_for_vote:
+        w_conf = 0.5 + abs(p - 0.5)             # 0.5~1.0
+        w_quality = min(1.0, q / 100.0)         # 대략 0~1
+        w_light = 1.0
+        if l < 40 or l > 210:                   # 극저조/과다노출
+            w_light = 0.85
+        w = w_conf * w_quality * w_light
+        weights.append(w)
+        scores.append(p)
+    S = float(np.dot(weights, scores) / max(np.sum(weights), 1e-6))
 
-    # 가장 높은 confidence 프레임을 이미지로 저장하고 base64로 인코딩
+    tau = 0.50
+    if len(scene_lumas) > 0 and (np.mean(scene_lumas) < 70 or np.mean(scene_lumas) > 210):
+        tau = 0.48  # 저조/과다노출에서 약간 완화
+    final_label = 'FAKE' if S >= tau else 'REAL'
+
+    # 대표 프레임(base64)
     if max_conf_frame is not None:
-        _, buffer = cv2.imencode('.jpg', max_conf_frame)
-        img_base64 = base64.b64encode(buffer).decode('utf-8')
+        ok, buffer = cv2.imencode('.jpg', max_conf_frame)
+        img_base64 = base64.b64encode(buffer).decode('utf-8') if ok else None
     else:
         img_base64 = None
 
-    avg_confidence = sum(r['confidence'] for r in results) / len(results)
+    # ===== 통계/지표 =====
+    conf_arr = np.array(per_frame_conf, dtype=np.float32) if per_frame_conf else np.zeros((0,), dtype=np.float32)
+    avg_confidence = float(conf_arr.mean()) if conf_arr.size else 0.0
+    median_confidence = float(np.median(conf_arr)) if conf_arr.size else None
+    variance_confidence = float(conf_arr.var()) if conf_arr.size else None
+    frame_vote_ratio = float(sum(1 for r in results if r['pred'] == 1)) / float(len(results))
+    processing_time_sec = time.time() - start_ts
+    fps_processed = (len(per_frame_conf)/processing_time_sec) if processing_time_sec > 0 else None
+    ms_per_sample = ((processing_time_sec / len(per_frame_conf)) * 1000.0) if len(per_frame_conf) > 0 else None
 
-    #테스트
-    print(f"결과: {final_label}")
-    print(f"평균 fake confidence: {avg_confidence:.4f}")
-    print(f"최고 confidence: {max_confidence:.4f}")
-    #print(f"이미지 image: {img_base64}")
+    # 히트맵 저장 (taskId별 폴더)
+    task_dir = os.path.join(OUTPUT_ROOT, task_id)
+    heatmap_path = os.path.join(task_dir, f"heatmap_{task_id}.png")
+    try:
+        save_heatmap(per_frame_conf, heatmap_path)
+    except Exception as e:
+        print(f"[WARN] heatmap save failed: {e}")
+        heatmap_path = None
+
+    # ===== 안정성 지표 (대표 프레임 1장 기준 + 시계열 기준) =====
+    tta_std = tta_mean = None
+    temporal_mean = temporal_std = None
+    if max_conf_frame is not None:
+        try:
+            tta_std, tta_mean = tta_consistency_std(max_conf_frame, mode, use_tta, use_illum)
+        except Exception as e:
+            print(f"[WARN] tta_consistency failed: {e}")
+        try:
+            temporal_mean, temporal_std = temporal_delta_stats(per_frame_conf)
+        except Exception as e:
+            print(f"[WARN] temporal stats failed: {e}")
+
+    # 속도 합격 여부
+    speed_ok = (
+        (fps_processed or 0.0) >= float(target_fps)
+        and (ms_per_sample or 1e12) <= float(max_latency_ms)
+    )
 
     return jsonify({
-        'result': final_label,
+        'taskId': task_id,
+        'result': final_label,        
+        'most_suspect_image': img_base64,  # base64 encoded image
+
+        'score_weighted': round(S, 4),
+        'threshold_tau': tau,
+        'frame_vote_ratio': round(frame_vote_ratio, 4),
+
         'average_fake_confidence': round(avg_confidence, 4),
+        'median_confidence': round(median_confidence, 4) if median_confidence is not None else None,
+        'variance_confidence': round(variance_confidence, 6) if variance_confidence is not None else None,
         'max_confidence': round(max_confidence, 4) if max_confidence >= 0 else None,
-        'mode': mode, 
-        'use_tta': use_tta, 
+        
+        'frames_processed': len(per_frame_conf),
+        'processing_time_sec': round(processing_time_sec, 3),
+        
+        # 실행 환경
+        'mode': mode,
+        'use_tta': use_tta,
         'use_illum': use_illum,
         'detector': detector,
         'smooth_window': smooth_window,
         'min_face': min_face,
         'sample_count': sample_count,
-        'taskId': task_id,
-        'most_suspect_image': img_base64,  # base64 encoded image
+        # 히트맵
+        'timeseries': {
+            'per_frame_conf': [float(x) for x in per_frame_conf],
+            'vmin': 0.0,
+            'vmax': 1.0
+        },
+        # 안정성 원시 값
+        'stability_evidence': {
+            'tta_std': round(tta_std, 6) if tta_std is not None else None,
+            'tta_mean': round(tta_mean, 6) if tta_mean is not None else None,
+            'temporal_delta_mean': round(temporal_mean, 6) if temporal_mean is not None else None,
+            'temporal_delta_std': round(temporal_std, 6) if temporal_std is not None else None
+        },
+       'speed': {
+            'fps_processed': round(fps_processed, 3) if fps_processed is not None else None,
+            'ms_per_sample': round(ms_per_sample, 1) if ms_per_sample is not None else None,
+            'target_fps': float(target_fps),
+            'max_latency_ms': float(max_latency_ms),
+            'speed_ok': bool(speed_ok),
+        }
     }), 200
 
 if __name__ == '__main__':
