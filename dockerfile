@@ -8,6 +8,7 @@ RUN apt-get update && apt-get install -y \
     build-essential \
     libsm6 \
     libxext6 \
+    libgl1-mesa-glx \
     && apt-get clean && rm -rf /var/lib/apt/lists/*
 
 # 3. 작업 디렉토리 설정
