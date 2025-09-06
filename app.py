@@ -3,7 +3,6 @@ import torch
 import torch.nn as nn
 from PIL import Image as pil_image
 import cv2
-import dlib
 import tempfile
 import os
 import base64
@@ -18,6 +17,17 @@ import time
 import matplotlib
 matplotlib.use("Agg")  # 서버(무헤드) 환경에서 플롯 저장
 import matplotlib.pyplot as plt
+
+try:
+    import dlib
+    face_detector = dlib.get_frontal_face_detector()
+    dlib_available = True
+    print("[INFO] dlib successfully loaded. Dlib detector is available.")
+except ImportError:
+    face_detector = None
+    dlib_available = False
+    print("[WARN] dlib library not found. Dlib-based face detector will be unavailable.")
+
 
 # ===== 설정 =====
 SPRING_SERVER_URL = 'http://localhost:8080/progress'
@@ -72,7 +82,7 @@ ensure_model()
 app = Flask(__name__)
 CORS(app, resources={r"/*": {"origins": "*"}})
 
-face_detector = dlib.get_frontal_face_detector()
+# face_detector = dlib.get_frontal_face_detector()
 
 # OpenCV DNN face detector (백업/정밀 기본)
 try:
@@ -208,7 +218,7 @@ def temporal_delta_stats(per_frame_conf):
 def detect_face_bboxes(frame_bgr, detector='auto', dnn_conf=0.6, max_boxes=5):
     h, w = frame_bgr.shape[:2]
     boxes = []
-    if detector in ('auto','dlib'):
+    if detector in ('auto','dlib') and dlib_available and face_detector is not None:
         try:
             gray = cv2.cvtColor(frame_bgr, cv2.COLOR_BGR2GRAY)
             faces = face_detector(gray)
