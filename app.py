@@ -159,15 +159,10 @@ def predict_tta_weighted(face_bgr, use_cond_illum=False):
         proc = illum_hsv(proc)
     augs = [
         ("orig", lambda x: x, 0.4),
-        ("flip", lambda x: cv2.flip(x, 1), None),
         ("rot+", lambda x: warp_rotate(x, +2), None),
         ("rot-", lambda x: warp_rotate(x, -2), None),
         ("sh+x", lambda x: warp_shift(x, +2, 0), None),
         ("sh-x", lambda x: warp_shift(x, -2, 0), None),
-        ("b+10", lambda x: cv2.convertScaleAbs(x, alpha=1.0, beta=10), None),
-        ("b-10", lambda x: cv2.convertScaleAbs(x, alpha=1.0, beta=-10), None),
-        ("ct+5", lambda x: cv2.convertScaleAbs(x, alpha=1.05, beta=0), None),
-        ("ct-5", lambda x: cv2.convertScaleAbs(x, alpha=0.95, beta=0), None),
     ]
     remain = 1.0 - 0.4
     rest = len(augs) - 1
@@ -296,6 +291,12 @@ def predict_video():
         use_illum = True if use_illum is None else (use_illum.lower() == 'true')
         smooth_window = smooth_window or 0   # EMA로 대체
         sample_count = sample_count or 20
+        if (detector == 'dnn') and (face_net is None):
+            if dlib_available and face_detector is not None:
+                print("[WARN] DNN face_net unavailable. Falling back to dlib for precision mode.")
+                detector = 'dlib'
+            else:
+                print("[ERROR] No face detector available for precision mode (DNN missing, dlib unavailable).")
     else:
         use_tta = False if use_tta is None else (use_tta.lower() == 'true')
         use_illum = False if use_illum is None else (use_illum.lower() == 'true')
@@ -443,22 +444,71 @@ def predict_video():
         }), 200
 
     # ===== 집계: 가중 투표 =====
-    weights, scores = [], []
-    for (p, q, l) in raw_conf_for_vote:
-        w_conf = 0.5 + abs(p - 0.5)             # 0.5~1.0
-        w_quality = min(1.0, q / 100.0)         # 대략 0~1
-        w_light = 1.0
-        if l < 40 or l > 210:                   # 극저조/과다노출
-            w_light = 0.85
+    # weights, scores = [], []
+    # for (p, q, l) in raw_conf_for_vote:
+    #     w_conf = 0.5 + abs(p - 0.5)             # 0.5~1.0
+    #     w_quality = min(1.0, q / 100.0)         # 대략 0~1
+    #     w_light = 1.0
+    #     if l < 40 or l > 210:                   # 극저조/과다노출
+    #         w_light = 0.85
+    #     w = w_conf * w_quality * w_light
+    #     weights.append(w)
+    #     scores.append(p)
+    # S = float(np.dot(weights, scores) / max(np.sum(weights), 1e-6))
+     # ==== CHANGED: 강건 집계 + 고신뢰 프레임 증거 도입 ======================
+     # raw_conf_for_vote 항목이 (p, q, l) 또는 (p, q, l, astd, area, dconf)일 수 있으니
+     # 앞 3개만 안전하게 꺼냄
+    weights, scores, conf_list = [], [], [r['confidence'] for r in results]
+ 
+    # 1) 기본 가중 (품질/조도 + 확신도)
+    for tup in raw_conf_for_vote:
+        p, q, l = tup[0], tup[1], tup[2]
+        w_conf   = 0.5 + abs(p - 0.5)                  # 0.5~1.0
+        w_quality= min(1.0, q / 110.0)                 # 품질 상향 기준
+        w_light  = 0.9 if (l < 40 or l > 210) else 1.0 # 극단 조명 패널티
         w = w_conf * w_quality * w_light
         weights.append(w)
         scores.append(p)
-    S = float(np.dot(weights, scores) / max(np.sum(weights), 1e-6))
-
+ 
+    # 2) 가중 평균
+    S_mean = float(np.dot(weights, scores) / max(np.sum(weights), 1e-6)) if weights else 0.0
+ 
+    # 3) 절단평균(상/하위 10% 제거)로 극단값 영향 억제
+    conf_sorted = sorted(conf_list)
+    if len(conf_sorted) >= 10:
+        k = max(1, int(0.10 * len(conf_sorted)))
+        trimmed = conf_sorted[k:len(conf_sorted)-k]
+        S_trim  = float(np.mean(trimmed)) if trimmed else S_mean
+    else:
+        S_trim = S_mean
+ 
+    # 4) 고신뢰 프레임 증거(두 가지 중 하나 충족 시 FAKE로 강하게 지지)
+    frac_high = (sum(c >= 0.80 for c in conf_list) / max(1, len(conf_list))) if conf_list else 0.0
+    # 짧은 강한 구간(연속 3프레임 0.75↑) 체크
+    streak3 = any(conf_list[i] >= 0.75 and conf_list[i+1] >= 0.75 and conf_list[i+2] >= 0.75
+                  for i in range(0, max(0, len(conf_list)-2)))
+     # =======================================================================
+  
     tau = 0.50
     if len(scene_lumas) > 0 and (np.mean(scene_lumas) < 70 or np.mean(scene_lumas) > 210):
         tau = 0.48  # 저조/과다노출에서 약간 완화
-    final_label = 'FAKE' if S >= tau else 'REAL'
+    # final_label = 'FAKE' if S >= tau else 'REAL'
+     # ==== CHANGED: 이중 임계 + 고신뢰 증거 + 보류(UNCERTAIN) =================
+    if mode == 'precision':
+        tau_low, tau_high = 0.50, 0.58   # 정밀: 오탐 억제는 보조규칙에 맡기고 τ는 과도하게 올리지 않음
+        need_frac_high    = 0.25         # conf≥0.8 프레임이 25% 이상이면 FAKE 지지
+    else:
+        tau_low, tau_high = 0.50, 0.62   # 기본: 속도모드라 평균이 높아도 보수적으로 한 번 더 확인
+        need_frac_high    = 0.35         # 기본은 더 많은 고신뢰 프레임 요구
+ 
+    S = S_trim  # 최종 판단은 절단평균 기반
+ 
+    final_label = 'UNCERTAIN'
+    if (S >= tau_high and (frac_high >= need_frac_high or streak3)):
+        final_label = 'FAKE'
+    else:
+        final_label = 'REAL'
+
 
     # 대표 프레임(base64)
     if max_conf_frame is not None:
@@ -511,7 +561,7 @@ def predict_video():
         'most_suspect_image': img_base64,  # base64 encoded image
 
         'score_weighted': round(S, 4),
-        'threshold_tau': tau,
+        'threshold_tau': tau_high,
         'frame_vote_ratio': round(frame_vote_ratio, 4),
 
         'average_fake_confidence': round(avg_confidence, 4),
