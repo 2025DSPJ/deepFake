@@ -142,42 +142,91 @@ def predict(face_bgr):
     return predict_single_tensor(to_tensor_bgr(face_bgr))
 
 # ===== 정밀 모드: 약한 기하/노출 브라케팅 TTA(가중 평균) =====
-def warp_rotate(img, angle=0):
-    h, w = img.shape[:2]
-    M = cv2.getRotationMatrix2D((w/2, h/2), angle, 1.0)
-    return cv2.warpAffine(img, M, (w, h), flags=cv2.INTER_LINEAR, borderMode=cv2.BORDER_REPLICATE)
+# 감마
+def aug_gamma(img, gamma=1.05):
+    inv = 1.0 / max(gamma, 1e-6)
+    lut = (np.linspace(0,1,256) ** inv * 255).astype(np.uint8)
+    return cv2.LUT(img, lut)
 
-def warp_shift(img, dx=0, dy=0):
-    h, w = img.shape[:2]
-    M = np.float32([[1,0,dx],[0,1,dy]])
-    return cv2.warpAffine(img, M, (w, h), flags=cv2.INTER_LINEAR, borderMode=cv2.BORDER_REPLICATE)
+# 색상톤
+def aug_hsv_jitter(img, dh=3, s_scale=1.03, v_scale=1.03):
+    hsv = cv2.cvtColor(img, cv2.COLOR_BGR2HSV)
+    h, s, v = cv2.split(hsv)
+    h = ((h.astype(np.int16) + dh) % 180).astype(np.uint8)
+    s = np.clip(s.astype(np.float32) * s_scale, 0, 255).astype(np.uint8)
+    v = np.clip(v.astype(np.float32) * v_scale, 0, 255).astype(np.uint8)
+    return cv2.cvtColor(cv2.merge([h, s, v]), cv2.COLOR_HSV2BGR)
+
+# 가우시안 블러
+def aug_gaussian_blur(img, sigma=0.6):
+    k = max(3, int(2*round(3*sigma)+1))
+    return cv2.GaussianBlur(img, (k, k), sigmaX=sigma)
+
+# 언샤프 마스크(USM)
+def aug_unsharp(img, amount=1.2, sigma=1.0):
+    blur = cv2.GaussianBlur(img, (0,0), sigma)
+    out = cv2.addWeighted(img, amount, blur, -(amount-1.0), 0)
+    return out
 
 def predict_tta_weighted(face_bgr, use_cond_illum=False):
     proc = face_bgr.copy()
     gray = cv2.cvtColor(proc, cv2.COLOR_BGR2GRAY)
+    _, conf_raw = predict_single_tensor(to_tensor_bgr(proc)) # RAW 단일 추론 (TTA 없이)
     if use_cond_illum and need_illum(gray):
         proc = illum_hsv(proc)
+    # --- 게이팅: 40%-90% 확률에서만 TTA 실행 ---
+    do_tta = True
+    if not (0.4 <= conf_raw <= 0.9 or abs(conf_raw-0.6) <= 0.03):
+        do_tta = False
+    if not do_tta:
+        return (1 if conf_raw >= 0.5 else 0), float(conf_raw)
     augs = [
-        ("orig", lambda x: x, 0.4),
-        ("rot+", lambda x: warp_rotate(x, +2), None),
-        ("rot-", lambda x: warp_rotate(x, -2), None),
-        ("sh+x", lambda x: warp_shift(x, +2, 0), None),
-        ("sh-x", lambda x: warp_shift(x, -2, 0), None),
-    ]
-    remain = 1.0 - 0.4
-    rest = len(augs) - 1
-    for i in range(1, len(augs)):
-        augs[i] = (augs[i][0], augs[i][1], remain / rest)
-    conf_acc, w_acc = 0.0, 0.0
+        ("orig", lambda x: x, 0.5),
+        ("hsv-", lambda x: aug_hsv_jitter(x, -3, 0.97, 0.97),    0.1),    
+        ("gblur", lambda x: aug_gaussian_blur(x, 0.5), 0.13),
+        ("usm",   lambda x: aug_unsharp(x, amount=1.2, sigma=1.0), 0.08),
+        ("gamma", lambda x: aug_gamma(x, gamma=1.05),               0.2), 
+    ]  
+
+    # 가중치 정규화
+    w_sum = sum(w for _,_,w in augs)
+    augs = [(n,f,w/w_sum) for (n,f,w) in augs]
+    vals, ws = [], []
     with torch.no_grad():
-        for name, aug, w in augs:
+        for _, aug, w in augs:
             img = aug(proc.copy())
             _, conf_i = predict_single_tensor(to_tensor_bgr(img))
-            conf_acc += w * conf_i
-            w_acc += w
-    conf = conf_acc / max(w_acc, 1e-6)
-    pred = 1 if conf >= 0.5 else 0
-    return pred, conf
+            vals.append(float(conf_i))
+            ws.append(float(w))
+    confs   = np.array(vals, dtype=np.float32)
+    base_ws = np.array(ws,   dtype=np.float32)
+
+    # 델타 기반 재가중
+    delta = confs - float(conf_raw)
+    k_push = 6.0
+    w_adj = base_ws * np.exp(-k_push * np.maximum(0.0, delta))
+    w_sum_adj = float(w_adj.sum())
+    if w_sum_adj < 1e-9:
+        w_adj = base_ws.copy()
+        w_sum_adj = float(w_adj.sum())
+    w_final = w_adj / w_sum_adj
+
+    # 가중평균
+    conf_tta = float((w_final * confs).sum()) 
+    std_conf = float(np.std(confs)) # 분산 기반 보정
+    if std_conf < 0.01: # std가 아주 작으면 TTA 무의미 → raw 사용
+        conf_tta = conf_raw
+    if std_conf > 0.05:  # std가 크면 과신 수축
+        shrink = min(0.25, 5.0 * (std_conf - 0.05))
+        conf_tta = 0.5 + (conf_tta - 0.5) * (1.0 - shrink)
+    
+    # 드리프트 캡
+    max_drift = 0.02 + 0.30 * std_conf
+    drift = conf_tta - conf_raw
+    if abs(drift) > max_drift:
+        conf_tta = conf_raw + np.sign(drift) * max_drift
+    pred = 1 if conf_tta >= 0.5 else 0
+    return pred, float(conf_tta)
 
 def infer_prob(face_bgr, mode, use_tta, use_illum):
     if (mode == 'precision') and use_tta:
@@ -191,10 +240,10 @@ def tta_consistency_std(face_bgr, mode, use_tta, use_illum):
     augs = [
         lambda x: x,
         lambda x: cv2.flip(x, 1),
-        lambda x: warp_rotate(x, +2),
-        lambda x: warp_rotate(x, -2),
-        lambda x: warp_shift(x, +2, 0),
-        lambda x: warp_shift(x, -2, 0),
+        lambda x: aug_hsv_jitter(x, -3, 0.97, 0.97),
+        lambda x: aug_gaussian_blur(x, 0.5),
+        lambda x: aug_unsharp(x, amount=1.2, sigma=1.0),
+        lambda x: aug_gamma(x, gamma=1.05),
         lambda x: cv2.convertScaleAbs(x, alpha=1.05, beta=0),
         lambda x: cv2.convertScaleAbs(x, alpha=0.95, beta=0),
     ]
@@ -246,6 +295,41 @@ def encode_jpg_base64(image_bgr):
     if not ok:
         return None
     return base64.b64encode(buf).decode('utf-8')
+
+# ===== robust 검출 =====
+def robust_detect(frame, *, detector="dnn", dnn_conf=0.30, resize_long=720, max_boxes=5):
+    H, W = frame.shape[:2]
+    # 1차 DNN
+    try:
+        bboxes = detect_face_bboxes(frame, detector="dnn", dnn_conf=dnn_conf, max_boxes=max_boxes)
+    except Exception as e:
+        print("[ERR] dnn first pass:", repr(e), flush=True); 
+        bboxes = []
+
+    # 리사이즈 후 재시도
+    if not bboxes:
+        long_side = resize_long or 720
+        scale = float(long_side) / float(max(H, W))
+        fr = cv2.resize(frame, (int(W*scale), int(H*scale)), interpolation=cv2.INTER_AREA) if scale < 1.0 else frame
+        try:
+            b2 = detect_face_bboxes(fr, detector="dnn", dnn_conf=0.25, max_boxes=max_boxes)
+        except Exception as e:
+            print("[ERR] dnn resized pass:", repr(e), flush=True); 
+            b2 = []
+        if b2:
+            inv = (1.0/scale) if scale>0 else 1.0
+            bboxes = [(int(x1*inv), int(y1*inv), int(x2*inv), int(y2*inv), conf) for (x1,y1,x2,y2,conf) in b2]
+    
+    # 폴백
+    if not bboxes and detector != "dlib":
+        try:
+            fb = detect_face_bboxes(frame, detector="dlib", max_boxes=max_boxes) or []
+            if fb:
+                print("[DBG] fallback dlib hit", flush=True)
+            bboxes = fb
+        except Exception as e:
+            print("[ERR] dlib fallback:", repr(e), flush=True); 
+    return bboxes
 
 # ===== API =====
 @app.route('/predict', methods=['POST'])
@@ -307,7 +391,11 @@ def predict_video():
     # 동영상 임시 저장
     with tempfile.NamedTemporaryFile(delete=False, suffix='.mp4') as tmp:
         video_path = tmp.name
-        video_file.save(video_path)
+        try:
+            video_file.stream.seek(0)
+        except Exception:
+            pass
+        video_file.save(tmp)
 
     cap = cv2.VideoCapture(video_path)
     num_frames = int(cap.get(cv2.CAP_PROP_FRAME_COUNT))
@@ -343,7 +431,14 @@ def predict_video():
 
                 if mode == 'precision':
                     # ---- 정밀 모드 ----
-                    bboxes = detect_face_bboxes(frame, detector=detector, dnn_conf=0.6, max_boxes=5)
+                    bboxes = robust_detect(frame, detector=detector)
+
+                    if not bboxes and os.getenv("BYPASS_DETECT", "0") == "1":
+                        H, W = frame.shape[:2]
+                        cx, cy = W // 2, H // 2
+                        s = min(H, W) // 3
+                        bboxes = [(cx - s, cy - s, cx + s, cy + s, 1.0)]
+
                     if bboxes:
                         bboxes_sorted_area = sorted(bboxes, key=lambda b:(b[2]-b[0])*(b[3]-b[1]), reverse=True)
                         primary = bboxes_sorted_area[0]
@@ -352,8 +447,8 @@ def predict_video():
                         chosen = [primary]
                         if secondary != primary and len(bboxes_sorted_area)>1:
                             chosen.append(secondary)
-
                         frame_best_conf = 0.0
+
                         for (x1,y1,x2,y2, conf_det) in chosen[:2]:
                             face_img = frame[y1:y2, x1:x2]
                             if face_img.size == 0 or min(face_img.shape[:2]) < min_face:
@@ -484,9 +579,9 @@ def predict_video():
         S_trim = S_mean
  
     # 4) 고신뢰 프레임 증거(두 가지 중 하나 충족 시 FAKE로 강하게 지지)
-    frac_high = (sum(c >= 0.80 for c in conf_list) / max(1, len(conf_list))) if conf_list else 0.0
+    frac_high = (sum(c >= 0.85 for c in conf_list) / max(1, len(conf_list))) if conf_list else 0.0
     # 짧은 강한 구간(연속 3프레임 0.75↑) 체크
-    streak3 = any(conf_list[i] >= 0.75 and conf_list[i+1] >= 0.75 and conf_list[i+2] >= 0.75
+    streak3 = any(conf_list[i] >= 0.8 and conf_list[i+1] >= 0.8 and conf_list[i+2] >= 0.8
                   for i in range(0, max(0, len(conf_list)-2)))
      # =======================================================================
   
@@ -503,6 +598,7 @@ def predict_video():
         need_frac_high    = 0.35         # 기본은 더 많은 고신뢰 프레임 요구
  
     S = S_trim  # 최종 판단은 절단평균 기반
+    print(S)
  
     final_label = 'UNCERTAIN'
     if (S >= tau_high and (frac_high >= need_frac_high or streak3)):
@@ -518,21 +614,50 @@ def predict_video():
     else:
         img_base64 = None
 
+    #축소 함수
+    def shrink_value_scalar(x, alpha=2.5):
+        x = float(np.clip(x, 0.0, 1.0))
+        return x ** alpha
+
+    def shrink_value_vec(arr, alpha=2.5):
+        arr = np.asarray(arr, dtype=np.float32)
+        arr = np.clip(arr, 0.0, 1.0)
+        return np.power(arr, alpha, dtype=np.float32)
+
     # ===== 통계/지표 =====
     conf_arr = np.array(per_frame_conf, dtype=np.float32) if per_frame_conf else np.zeros((0,), dtype=np.float32)
-    avg_confidence = float(conf_arr.mean()) if conf_arr.size else 0.0
+    # --- 절단 전처리(상위 10% 제거) ---
+    if conf_arr.size >= 10:
+        k_trim = max(1, int(0.10 * conf_arr.size))
+        conf_sorted = np.sort(conf_arr)
+        conf_trimmed = conf_sorted[:conf_arr.size-k_trim] if (2*k_trim) < conf_sorted.size else conf_sorted
+    else:
+        k_trim = 0
+        conf_trimmed = conf_arr  # 샘플이 적으면 원본 유지
+
+    avg_confidence = float(conf_trimmed.mean()) if conf_trimmed.size else None
+    max_confidence = float(conf_trimmed.max()) if conf_trimmed.size else None
     median_confidence = float(np.median(conf_arr)) if conf_arr.size else None
     variance_confidence = float(conf_arr.var()) if conf_arr.size else None
     frame_vote_ratio = float(sum(1 for r in results if r['pred'] == 1)) / float(len(results))
     processing_time_sec = time.time() - start_ts
     fps_processed = (len(per_frame_conf)/processing_time_sec) if processing_time_sec > 0 else None
     ms_per_sample = ((processing_time_sec / len(per_frame_conf)) * 1000.0) if len(per_frame_conf) > 0 else None
+    print(f"avg_confidence: {avg_confidence}, max_confidence: {max_confidence}, final_label: {final_label}")
+    
+    # 축소 통계 
+    ALPHA =1.2
+    conf_trimmed_shr = shrink_value_vec(conf_trimmed, alpha=ALPHA)
+
+    avg_confidence = float(conf_trimmed_shr.mean()) if conf_trimmed_shr.size else 0.0
+    max_confidence = float(conf_trimmed_shr.max())  if conf_trimmed_shr.size else None
 
     # 히트맵 저장 (taskId별 폴더)
     task_dir = os.path.join(OUTPUT_ROOT, task_id)
     heatmap_path = os.path.join(task_dir, f"heatmap_{task_id}.png")
     try:
-        save_heatmap(per_frame_conf, heatmap_path)
+        per_frame_conf_shr = [float(shrink_value_scalar(x, alpha=ALPHA)) for x in per_frame_conf]  # 0~1 범위 유지
+        save_heatmap(per_frame_conf_shr, heatmap_path)
     except Exception as e:
         print(f"[WARN] heatmap save failed: {e}")
         heatmap_path = None
