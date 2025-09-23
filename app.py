@@ -40,9 +40,9 @@ TARGET_FPS_DEFAULT = float(os.environ.get("TARGET_FPS", "1.0"))         # 목표
 MAX_LAT_MS_DEFAULT = float(os.environ.get("MAX_LATENCY_MS", "2000"))    # 프레임당 최대 지연(ms)
 
 # ===== 유틸: 진행률 보고 =====
-def send_progress_to_spring(task_id, percent):
+def send_progress_to_spring(task_id, percent, login_id):
     try:
-        payload = {'taskId': task_id, 'progress': percent}
+        payload = {'taskId': task_id, 'progress': percent, 'loginId':login_id}
         headers = {'Content-Type': 'application/json'}
         requests.post(SPRING_SERVER_URL, json=payload, headers=headers, timeout=1)
     except Exception as e:
@@ -261,6 +261,7 @@ def predict_video():
     task_id = request.form.get('taskId') or str(uuid.uuid4())
     print(f"[INFO] taskId={task_id}")
 
+    login_id = request.form.get('loginId')
     mode = request.form.get('mode', 'default')  # "default" | "precision"
     use_tta = request.form.get('use_tta')
     use_illum = request.form.get('use_illum')
@@ -423,7 +424,7 @@ def predict_video():
 
             processed_frames += 1
             progress_percent = int(100 * processed_frames / max(1, expected))
-            send_progress_to_spring(task_id, progress_percent)
+            send_progress_to_spring(task_id, progress_percent,login_id)
 
         frame_idx += 1
 
