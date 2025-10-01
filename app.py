@@ -580,9 +580,9 @@ def predict_video():
  
     # 4) 고신뢰 프레임 증거(두 가지 중 하나 충족 시 FAKE로 강하게 지지)
     frac_high = (sum(c >= 0.85 for c in conf_list) / max(1, len(conf_list))) if conf_list else 0.0
-    # 짧은 강한 구간(연속 3프레임 0.75↑) 체크
+    # 짧은 강한 구간(연속 3프레임 0.8↑) 체크
     streak3 = any(conf_list[i] >= 0.8 and conf_list[i+1] >= 0.8 and conf_list[i+2] >= 0.8
-                  for i in range(0, max(0, len(conf_list)-2)))
+                for i in range(0, max(0, len(conf_list)-2)))
      # =======================================================================
   
     tau = 0.50
@@ -603,9 +603,14 @@ def predict_video():
     final_label = 'UNCERTAIN'
     if (S >= tau_high and (frac_high >= need_frac_high or streak3)):
         final_label = 'FAKE'
-    else:
+    elif S <= tau_low:
         final_label = 'REAL'
-
+    else:
+        if any(conf_list[i] >= 0.7 and conf_list[i+1] >= 0.7 
+                for i in range(0, max(0, len(conf_list)-1))) and any(conf_list[i] <= 0.6 and conf_list[i+1] <= 0.6 
+                                                                    for i in range(0, max(0, len(conf_list)-1)))==False:      
+            final_label = 'FAKE'
+        else: final_label = 'REAL'
 
     # 대표 프레임(base64)
     if max_conf_frame is not None:
