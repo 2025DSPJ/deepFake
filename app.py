@@ -30,7 +30,7 @@ except ImportError:
 
 
 # ===== 설정 =====
-SPRING_SERVER_URL = 'http://localhost:8080/progress'
+SPRING_SERVER_URL = os.environ.get('SPRING_SERVER_URL', 'http://localhost:8080/progress')
 MODEL_PATH = './model/xception.pth'
 OUTPUT_ROOT = os.environ.get("OUTPUT_ROOT", "./outputs")  # 그래프 저장 루트
 os.makedirs(OUTPUT_ROOT, exist_ok=True)
