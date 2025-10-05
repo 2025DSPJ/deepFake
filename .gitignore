@@ -5,9 +5,11 @@ model/
 test.html
 outputs/
 video/
+results/
 deepfake_videos.csv
 eval_compare.py
 make_csv.py
 test.csv
 app_test.py
 .env
+app_original.py
