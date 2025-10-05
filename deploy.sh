@@ -14,5 +14,5 @@ docker run -d --gpus all \
   -p 8000:5001 \
   --name deepfake_container \
   --restart unless-stopped \
-  --env-file ./.env \
+  --env-file ./deepFake/.env \
   jihye0623/deeptruth-deepfake:latest
