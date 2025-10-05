@@ -28,7 +28,6 @@ except ImportError:
     dlib_available = False
     print("[WARN] dlib library not found. Dlib-based face detector will be unavailable.")
 
-
 # ===== 설정 =====
 SPRING_SERVER_URL = os.environ.get('SPRING_SERVER_URL', 'http://localhost:8080/progress')
 MODEL_PATH = './model/xception.pth'
@@ -81,8 +80,6 @@ def save_heatmap(per_frame_conf, out_path):
 ensure_model()
 app = Flask(__name__)
 CORS(app, resources={r"/*": {"origins": "*"}})
-
-# face_detector = dlib.get_frontal_face_detector()
 
 # OpenCV DNN face detector (백업/정밀 기본)
 try:
