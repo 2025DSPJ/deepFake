@@ -10,3 +10,4 @@ flask-cors
 requests
 gunicorn
 matplotlib
+dlib
